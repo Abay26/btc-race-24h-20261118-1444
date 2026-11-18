@@ -19,6 +19,11 @@
  *   - take-profit: the close is 70 bps above the entry fill price,
  *   - stop-loss: the close is 150 bps below the entry fill price,
  *   - time stop: 360 bars (6 hours) have passed since the fill.
+ * - After a stop-loss exit, no new entry for 30 bars: the leg that just
+ *   stopped out is still falling, and the snap-back shape can re-trigger
+ *   straight back into it. The cooldown never fires on the dev window
+ *   (no stop-loss is hit there), so it costs nothing there; it is a guard
+ *   for the live race, where a stop-loss can happen.
  *
  * Nothing here looks at highs, lows, rolling means or volatility bands:
  * the whole decision is two returns (60-bar and 5-bar) plus the distance
@@ -51,6 +56,7 @@ const TAKE_PROFIT_BPS = 70; // exit when the close is this far above the fill
 const STOP_LOSS_BPS = 150; // exit when the close is this far below the fill
 const MAX_HOLD_BARS = 360; // exit after this many bars in the trade, whatever
 const MAX_SLIPPAGE_BPS = 100; // 1% past the close the order was decided on
+const COOLDOWN_AFTER_SL_BARS = 30; // no new entry for this many bars after a stop-loss
 
 /** Returns, in basis points, of `now` against `then` (both raw price units). */
 function returnBps(now: bigint, then: bigint): bigint {
@@ -62,11 +68,13 @@ class Snapback {
   closes: bigint[] = []; // closes of past bars, oldest first, at most 60
   entryPx: bigint | null = null; // fill price of the open trade
   barsHeld = 0; // batches seen holding the trade
+  cooldownBars = 0; // bars left before a new entry is allowed after a stop-loss
 
   /** Record the bar that just closed, keeping only the last 60 closes. */
   observe(close: bigint): void {
     this.closes.push(close);
     if (this.closes.length > LOOKBACK_BARS) this.closes.shift();
+    if (this.cooldownBars > 0) this.cooldownBars -= 1;
   }
 
   get historyReady(): boolean {
@@ -108,7 +116,11 @@ await runBars({
       // Observe the close only after judging it against the history that
       // came before it: the 60-bar and 5-bar returns must not include the
       // bar being judged, or both comparisons would be diluted.
-      const shape = ready && bot.snapbackShape;
+      // A stop-loss cooldown also blocks the entry: after an SL exit the
+      // leg is still falling, so a shape that fires at once is a re-entry
+      // into the same slide, not a fresh snap-back.
+      const shape =
+        ready && bot.snapbackShape && bot.cooldownBars <= 0;
       bot.observe(close);
       if (!shape) return [];
       if (state.cash >= BigInt(state.hello.fees.min_notional_quote_units)) {
@@ -133,12 +145,16 @@ await runBars({
       bot.barsHeld += 1;
     }
     const changeBps = Number(returnBps(close, bot.entryPx));
+    const stoppedOut = changeBps <= -STOP_LOSS_BPS;
     bot.observe(close);
     if (
       changeBps >= TAKE_PROFIT_BPS ||
-      changeBps <= -STOP_LOSS_BPS ||
+      stoppedOut ||
       bot.barsHeld >= MAX_HOLD_BARS
     ) {
+      // A stop-loss exit arms the re-entry cooldown; a take-profit or a
+      // time-stop exit does not.
+      if (stoppedOut) bot.cooldownBars = COOLDOWN_AFTER_SL_BARS;
       bot.entryPx = null;
       bot.barsHeld = 0;
       return [
